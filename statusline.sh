@@ -2,17 +2,21 @@
 # Claude Code status line: two right-aligned rows.
 #
 #   user@host:cwd                          last in <i> out <o> | sess in <i> out <o>
-#   owner/repo (or "no github repo")                  $<cost> | ctx <used>/<size> <pct>%
+#   owner/repo #<pr> (or "no github repo")            $<cost> | ctx <used>/<size> <pct>%
 #
 # - "last": the most recent turn's newly-processed input (input + cache_creation) and output.
 # - "sess": cumulative tokens this session, summed from the transcript (deduped by message.id),
 #           cached by transcript byte-size so repaints don't re-parse an unchanged file.
+# - "#<pr>": latest PR whose head is the current branch, as an OSC-8 link. Looked up via `gh`,
+#           cached per (repo,branch) and refreshed in the BACKGROUND on a TTL — the repaint
+#           always serves the cached value and never blocks on the network.
 # - "ctx" : current context-window occupancy; "$": native cumulative cost.total_cost_usd.
 # - Counts >= 1000 are abbreviated k/M, else shown exact.
 # - Pure ASCII + interior padding only, so measured width == painted width. Right edge is
 #   padded to COLUMNS-4 (the TUI's usable area); tune that constant if your terminal differs.
 #
-# Requires: bash, jq, coreutils (wc/stat/md5sum), awk, sed. git is optional (repo line).
+# Requires: bash, jq, coreutils (wc/stat/md5sum), awk, sed. Optional: git (repo line),
+#           gh + timeout (PR link).
 
 input=$(cat)
 
@@ -66,15 +70,43 @@ if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
   fi
 fi
 
-# --- github repo (local git only, no network): slug + url, else empty ---
-SLUG=""; REPOURL=""
+# --- github repo + current branch (local git only, no network): slug + url + branch, else empty ---
+SLUG=""; REPOURL=""; BRANCH=""
 if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null)   # empty on detached HEAD
   rurl=$(git -C "$CWD" remote get-url origin 2>/dev/null)
   case "$rurl" in
     *github.com*)
       SLUG=$(printf '%s' "$rurl" | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#^ssh://[^/]+/##; s#\.git$##')
       [ -n "$SLUG" ] && REPOURL="https://github.com/$SLUG" ;;
   esac
+fi
+
+# --- latest PR for the current branch (gh; cached per (repo,branch), refreshed async) ---
+# The repaint serves whatever is cached and NEVER waits on gh. When the cache is older than
+# PR_TTL, one background refresher (guarded by a mkdir lock) re-queries and rewrites the cache
+# for the next repaint. An empty result is cached too, so branches with no PR don't re-query.
+PRNUM=""; PRURL=""; PR_TTL=120
+if [ -n "$SLUG" ] && [ -n "$BRANCH" ] && command -v gh >/dev/null 2>&1; then
+  {
+    pf="$CACHE/pr-$(hashk "$SLUG|$BRANCH")"
+    [ -f "$pf" ] && { mapfile -t PR < "$pf"; PRNUM=${PR[0]:-}; PRURL=${PR[1]:-}; }
+    now=$(date +%s); ts=0; [ -f "$pf" ] && ts=$(stat -c %Y "$pf" 2>/dev/null || echo 0)
+    if [ $(( now - ts )) -ge "$PR_TTL" ]; then
+      lock="$pf.lock"
+      # clear a lock left behind by a refresher that died mid-flight
+      [ -d "$lock" ] && [ $(( now - $(stat -c %Y "$lock" 2>/dev/null || echo "$now") )) -ge 60 ] && rmdir "$lock" 2>/dev/null
+      if mkdir "$lock" 2>/dev/null; then
+        ( j=$(timeout 10 gh pr list --repo "$SLUG" --head "$BRANCH" --state all \
+                --json number,url --limit 1 2>/dev/null \
+              | jq -r '.[0] | "\(.number // "")\n\(.url // "")"' 2>/dev/null)
+          n=$(printf '%s\n' "$j" | sed -n '1p'); u=$(printf '%s\n' "$j" | sed -n '2p')
+          printf '%s\n%s\n' "$n" "$u" > "$pf.tmp" && mv -f "$pf.tmp" "$pf"  # atomic; no torn read
+          rmdir "$lock" 2>/dev/null ) >/dev/null 2>&1 &
+        disown 2>/dev/null
+      fi
+    fi
+  }
 fi
 
 # ---------- presentation ----------
@@ -106,8 +138,13 @@ if [ "$(pw "$L1p")" -gt "$avail" ] && [ "$avail" -gt 12 ]; then
   if [ "$keep" -gt 3 ]; then CWDD2="..${CWDD: -keep}"; L1p="${prefix}${CWDD2}"; L1d="${G}${USER_}@${HOST_}${R}:${B}${CWDD2}${R}"; fi
 fi
 
-# ROW 2 — left: github repo link or "no github repo"   right: cost + ctx
-if [ -n "$SLUG" ]; then L2p="$SLUG"; L2d="${D}$(link "$REPOURL" "$SLUG")${R}"
+# ROW 2 — left: github repo link (+ branch + latest PR) or "no github repo"   right: cost + ctx
+if [ -n "$SLUG" ]; then
+  L2p="$SLUG"; L2d="${D}$(link "$REPOURL" "$SLUG")${R}"
+  if [ -n "$BRANCH" ]; then L2p="$L2p $BRANCH"; L2d="$L2d ${G}${BRANCH}${R}"; fi
+  if [ -n "$PRNUM" ] && [ -n "$PRURL" ]; then
+    L2p="$L2p #$PRNUM"; L2d="$L2d ${C}$(link "$PRURL" "#$PRNUM")${R}"
+  fi
 else L2p="no github repo"; L2d="${D}no github repo${R}"; fi
 R2p="\$${COSTF} | ctx $(abbr "$CTX_USED")/$(abbr "$CTX_SIZE") ${CTX_PCT}%"
 R2d="${Y}\$${COSTF}${R} ${D}|${R} ${D}ctx${R} ${C}$(abbr "$CTX_USED")${R}${D}/$(abbr "$CTX_SIZE") ${CTX_PCT}%${R}"

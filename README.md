@@ -1,10 +1,10 @@
 # claude-code-statusbar
 
-A two-row, right-aligned [Claude Code](https://claude.com/claude-code) status line that shows token usage, session cost, context-window occupancy, and the current GitHub repo.
+A two-row, right-aligned [Claude Code](https://claude.com/claude-code) status line that shows token usage, session cost, context-window occupancy, the current GitHub repo, the checked-out branch, and the latest PR for that branch.
 
 ```
 o@host:~/work/project                         last in 780 out 401 | sess in 4.7M out 117k
-owner/repo                                                  $3.8677 | ctx 96.4k/1M 10%
+owner/repo main #1763                                       $3.8677 | ctx 96.4k/1M 10%
 ```
 
 ## What it shows
@@ -17,13 +17,17 @@ owner/repo                                                  $3.8677 | ctx 96.4k/
 | `$<cost>`        | native cumulative session cost (`cost.total_cost_usd`) |
 | `ctx <used>/<size> <pct>%` | current context-window occupancy |
 | `owner/repo`     | the cwd's GitHub repo as a clickable link, or `no github repo` |
+| `<branch>`       | the checked-out branch (omitted on detached HEAD) |
+| `#<pr>`          | latest PR whose head is that branch, as a clickable link (omitted if none) |
 
 Token counts ≥ 1000 are abbreviated `k`/`M`; smaller values are shown exact.
 
 ## Requirements
 
 - `bash`, `jq`, coreutils (`wc`, `stat`, `md5sum`), `awk`, `sed`
-- `git` is optional — only used (locally, no network) to detect the repo line
+- `git` is optional — only used (locally, no network) to detect the repo + branch
+- `gh` (+ `timeout`) is optional — only used to resolve the PR link; without it the branch
+  still shows and the PR is simply omitted
 
 ## Install
 
@@ -69,7 +73,14 @@ Status lines are deceptively fiddly. This script deliberately:
 - pads to `COLUMNS - 4` rather than `COLUMNS`, because the reported terminal width is not the
   writable status-line width;
 - caches the cumulative-token transcript scan by file **byte-size** (transcripts only grow),
-  so frequent repaints don't re-parse a large unchanged file.
+  so frequent repaints don't re-parse a large unchanged file;
+- **never blocks the repaint on the network.** The PR link is resolved by `gh` in a
+  *background* job (guarded by a `mkdir` lock and `timeout`), cached per `(repo, branch)`, and
+  refreshed only when older than a TTL (`PR_TTL`, default 120s). Each repaint serves the
+  cached value instantly. Consequence: the first paint after launching or switching branches
+  shows repo+branch only, and the PR appears on a subsequent repaint; a brand-new PR can take
+  up to `PR_TTL` to surface. Empty results are cached too, so branches with no PR don't
+  re-query every paint.
 
 ## License
 
