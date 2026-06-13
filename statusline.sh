@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Claude Code status line: two right-aligned rows.
 #
-#   user@host:cwd                          last in <i> out <o> | sess in <i> out <o>
-#   owner/repo #<pr> (or "no github repo")            $<cost> | ctx <used>/<size> <pct>%
+#   user@host:cwd                          in <1+2> | tool <3> | out <4>
+#   owner/repo <branch> #<pr> (or "no github repo")   $<cost> | ctx <used>/<size> <pct>%
 #
-# - "last": the most recent turn's newly-processed input (input + cache_creation) and output.
-# - "sess": cumulative tokens this session, summed from the transcript (deduped by message.id),
-#           cached by transcript byte-size so repaints don't re-parse an unchanged file.
+# Cumulative token usage by area, all derived from the usage counters (no tokenizer). Per
+# assistant request t: I_t = input + cache_creation + cache_read (full prompt size);
+# U_t = (I_t - I_{t-1}) - out_{t-1} (new external input that turn). Then:
+# - "in"   (1+2): injected context (system/tools/skills) + your input. These two cannot be
+#                 split from the usage numbers alone (a turn's delta can lump both), so they
+#                 are shown combined and honest, not split by a guess.
+# - "tool" (3)  : tool-result tokens (Read/Bash/WebFetch...), labeled by tool name.
+# - "out"  (4)  : model output (thinking + text + tool calls) = sum of out_t.
+#   in + tool + out = the cumulative total; cached by transcript byte-size.
 # - "#<pr>": latest PR whose head is the current branch, as an OSC-8 link. Looked up via `gh`,
 #           cached per (repo,branch) and refreshed in the BACKGROUND on a TTL — the repaint
 #           always serves the cached value and never blocks on the network.
@@ -53,20 +59,41 @@ USER_=$(id -un 2>/dev/null)
 HOST_=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
 CWDD="$CWD"; case "$CWDD" in "$HOME") CWDD="~";; "$HOME"/*) CWDD="~${CWDD#"$HOME"}";; esac
 
-# --- cumulative session tokens (cached by transcript byte size; files only grow) ---
-CIN=0; COUT=0
+# --- cumulative token usage by area (cached by transcript byte size; files only grow) ---
+# Buckets:  CIN = injected + your input (1+2)   CTOOL = tool results (3)   COUT = model output (4)
+# A tool-result turn's U_t -> CTOOL (unless the tool is "Skill", which is injected -> CIN);
+# every other positive U_t and the baseline I_1 -> CIN; sum of out_t -> COUT. Evictions ignored.
+CIN=0; CTOOL=0; COUT=0
 if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
   sz=$(stat -c %s "$TRANSCRIPT" 2>/dev/null || echo 0)
-  cf="$CACHE/cum-$(hashk "$TRANSCRIPT")"
-  csz=""; [ -f "$cf" ] && { mapfile -t CC < "$cf"; csz=${CC[0]}; CIN=${CC[1]:-0}; COUT=${CC[2]:-0}; }
+  cf="$CACHE/cat-$(hashk "$TRANSCRIPT")"
+  csz=""; [ -f "$cf" ] && { mapfile -t CC < "$cf"; csz=${CC[0]}; CIN=${CC[1]:-0}; CTOOL=${CC[2]:-0}; COUT=${CC[3]:-0}; }
   if [ "${csz:-x}" != "$sz" ]; then
-    mapfile -t S < <(jq -rs '
-      [ .[] | select(.type=="assistant") | {id: .message.id, u: .message.usage} ] | unique_by(.id)
-      | (reduce .[] as $m (0; . + (($m.u.input_tokens)//0)+(($m.u.cache_creation_input_tokens)//0)+(($m.u.cache_read_input_tokens)//0))) as $i
-      | (reduce .[] as $m (0; . + (($m.u.output_tokens)//0))) as $o
-      | $i, $o' "$TRANSCRIPT" 2>/dev/null)
-    CIN=${S[0]:-0}; COUT=${S[1]:-0}
-    printf '%s\n%s\n%s\n' "$sz" "$CIN" "$COUT" > "$cf"
+    out=$(jq -rs '
+      (reduce .[] as $e ({}; if $e.type=="assistant" then
+         reduce ($e.message.content[]?|select(.type=="tool_use")) as $t (.; .[$t.id]=$t.name) else . end)) as $names
+      | .[]
+      | if .type=="user" then
+          (.message.content) as $c
+          | if ($c|type)=="string" then "H\t-\t0\t0"
+            elif ($c|type)=="array" then
+              ([ $c[]|select(.type=="tool_result")|.tool_use_id ]) as $ids
+              | if ($ids|length)>0 then "R\t\($names[$ids[0]] // "?")\t0\t0"
+                elif any($c[]; .type=="text" or .type=="image") then "H\t-\t0\t0" else "X\t-\t0\t0" end
+            else "X\t-\t0\t0" end
+        elif .type=="assistant" then
+          "A\t\(.message.id)\t\((.message.usage.input_tokens//0)+(.message.usage.cache_creation_input_tokens//0)+(.message.usage.cache_read_input_tokens//0))\t\(.message.usage.output_tokens//0)"
+        else empty end' "$TRANSCRIPT" 2>/dev/null | awk -F'\t' '
+      $1=="H"{ pend=(pend==""?"H":(pend=="R"?"MIX":pend)); next }
+      $1=="R"{ if(pend==""){pend="R";pname=$2} else if(pend=="H")pend="MIX"; next }
+      $1=="A"{ id=$2;I=$3+0;O=$4+0; if(seen[id])next; seen[id]=1; n++;
+        if(n==1)comb+=I;
+        else{ U=(I-prevI)-prevO; if(U>=0){ if(pend=="R"&&pname!="Skill")tool+=U; else comb+=U } }
+        model+=O; prevI=I; prevO=O; pend=""; pname="" }
+      END{ printf "%d %d %d", comb, tool, model }')
+    read -r CIN CTOOL COUT <<<"$out"
+    CIN=${CIN:-0}; CTOOL=${CTOOL:-0}; COUT=${COUT:-0}
+    printf '%s\n%s\n%s\n%s\n' "$sz" "$CIN" "$CTOOL" "$COUT" > "$cf"
   fi
 fi
 
@@ -120,17 +147,16 @@ COLS=${COLUMNS:-}; [ -z "$COLS" ] && COLS=$(tput cols 2>/dev/null); [[ "$COLS" =
 COLS=$(( COLS - 4 )); [ "$COLS" -lt 20 ] && COLS=20
 
 COSTF=$(printf '%.4f' "$COST" 2>/dev/null || printf '%s' "$COST")
-LIN=$(( ${U_IN:-0} + ${U_CC:-0} ))
 
 emit_row(){ # leftplain leftdec rightplain rightdec  -> one right-aligned row
   local pad=$(( COLS - $(pw "$1") - $(pw "$3") )); [ "$pad" -lt 1 ] && pad=1
   printf '%s%s%s\n' "$2" "$(sp "$pad")" "$4"
 }
 
-# ROW 1 — left: user@host:cwd   right: last + session
+# ROW 1 — left: user@host:cwd   right: token usage by area  (1+2)=in | 3=tool | 4=out
 L1p="${USER_}@${HOST_}:${CWDD}"; L1d="${G}${USER_}@${HOST_}${R}:${B}${CWDD}${R}"
-R1p="last in $(abbr "$LIN") out $(abbr "$U_OUT") | sess in $(abbr "$CIN") out $(abbr "$COUT")"
-R1d="${D}last in${R} ${C}$(abbr "$LIN")${R} ${D}out${R} ${C}$(abbr "$U_OUT")${R} ${D}|${R} ${D}sess in${R} ${C}$(abbr "$CIN")${R} ${D}out${R} ${C}$(abbr "$COUT")${R}"
+R1p="in $(abbr "$CIN") | tool $(abbr "$CTOOL") | out $(abbr "$COUT")"
+R1d="${D}in${R} ${C}$(abbr "$CIN")${R} ${D}|${R} ${D}tool${R} ${C}$(abbr "$CTOOL")${R} ${D}|${R} ${D}out${R} ${C}$(abbr "$COUT")${R}"
 # trim cwd from the left if it would collide with the right block (ASCII '..' marker)
 avail=$(( COLS - $(pw "$R1p") - 2 ))
 if [ "$(pw "$L1p")" -gt "$avail" ] && [ "$avail" -gt 12 ]; then

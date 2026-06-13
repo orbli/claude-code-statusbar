@@ -3,17 +3,23 @@
 A two-row, right-aligned [Claude Code](https://claude.com/claude-code) status line that shows token usage, session cost, context-window occupancy, the current GitHub repo, the checked-out branch, and the latest PR for that branch.
 
 ```
-o@host:~/work/project                         last in 780 out 401 | sess in 4.7M out 117k
-owner/repo main #1763                                       $3.8677 | ctx 96.4k/1M 10%
+o@host:~/work/project                            in 268k | tool 22k | out 251k
+owner/repo main #1763                                  $3.8677 | ctx 96.4k/1M 10%
 ```
 
 ## What it shows
 
+Row 1 breaks cumulative token usage into three areas, all derived from the `usage`
+counters (no tokenizer). For each assistant request `t`, let `I_t = input + cache_creation
++ cache_read` (full prompt size) and `U_t = (I_t − I_{t−1}) − out_{t−1}` (new external
+input that turn). Then:
+
 | Field | Meaning |
 |-------|---------|
 | `user@host:cwd` | identity + working directory (`~` for `$HOME`) |
-| `last in / out`  | the most recent turn's newly-processed input (`input + cache_creation`) and output tokens |
-| `sess in / out`  | cumulative tokens this session, summed from the transcript (deduped by `message.id`) |
+| `in`   (1+2) | injected context (system/tools/skills) **+** your input. These two can't be split from the usage numbers alone — a turn's delta can lump both — so they're shown **combined**, not guessed apart. |
+| `tool` (3)   | tool-result tokens (Read/Bash/WebFetch…), summed over `tool_result` turns and labeled by tool name |
+| `out`  (4)   | model output (thinking + text + tool calls) = sum of `out_t` |
 | `$<cost>`        | native cumulative session cost (`cost.total_cost_usd`) |
 | `ctx <used>/<size> <pct>%` | current context-window occupancy |
 | `owner/repo`     | the cwd's GitHub repo as a clickable link, or `no github repo` |
