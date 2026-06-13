@@ -70,3 +70,7 @@ Status lines are deceptively fiddly. This script deliberately:
   writable status-line width;
 - caches the cumulative-token transcript scan by file **byte-size** (transcripts only grow),
   so frequent repaints don't re-parse a large unchanged file.
+
+## License
+
+[MIT](LICENSE)
